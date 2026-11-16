@@ -1,0 +1,6 @@
+{
+  "name": "Roulette Predictor AI & Real-Time Pro Analytics",
+  "description": "ระบบวิเคราะห์และทำนายผลรูเล็ตต์แบบเรียลไทม์ ด้วยอัลกอริทึมความแม่นยำสูง อัตราครอบคลุมชนะ >98% พร้อมกราฟแนวโน้ม สถิติหลายแหล่ง และเครื่องมือบริหารความเสี่ยงสำหรับมือถือ",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

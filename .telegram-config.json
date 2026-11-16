@@ -1,0 +1,10 @@
+{
+  "botToken": "9042710612:AAFsvgyUESX3yh90GqR8gwBjnxS-J1ZyP20",
+  "chatId": "",
+  "botUsername": "@roullet2024_bot",
+  "chatTitle": "",
+  "autoBroadcastOnAppSpin": true,
+  "autoBroadcastOnTelegramSpin": true,
+  "includeFullStatsInBroadcast": true,
+  "pollingActive": true
+}
