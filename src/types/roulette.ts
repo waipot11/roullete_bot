@@ -159,12 +159,15 @@ export interface BankrollConfig {
 
 export interface TelegramPublicConfig {
   hasToken: boolean;
+  hasEnvToken?: boolean;
   maskedToken: string;
   chatId: string;
   botUsername: string;
   chatTitle: string;
   isConnected: boolean;
   pollingActive: boolean;
+  receiverMode?: 'webhook' | 'polling';
+  webhookActive?: boolean;
   autoBroadcastOnAppSpin: boolean;
   autoBroadcastOnTelegramSpin: boolean;
   includeFullStatsInBroadcast: boolean;

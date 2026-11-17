@@ -613,6 +613,7 @@ export default function App() {
     botToken?: string;
     chatId?: string;
     pollingActive?: boolean;
+    receiverMode?: 'webhook' | 'polling';
     autoBroadcastOnAppSpin?: boolean;
     autoBroadcastOnTelegramSpin?: boolean;
     includeFullStatsInBroadcast?: boolean;
@@ -629,6 +630,17 @@ export default function App() {
       return { ok: Boolean(res.ok && data.ok), error: data.error || data.telegramConfig?.lastError };
     } catch {
       return { ok: false, error: 'ไม่สามารถติดต่อเซิร์ฟเวอร์ได้' };
+    }
+  }, [applyServerState]);
+
+  const handleReconnectTelegram = useCallback(async () => {
+    try {
+      const res = await fetch('/api/telegram/reconnect', { method: 'POST' });
+      const data = (await res.json()) as { ok: boolean; state?: ServerAppStatePayload };
+      if (data.state) applyServerState(data.state);
+      return Boolean(res.ok && data.ok);
+    } catch {
+      return false;
     }
   }, [applyServerState]);
 
@@ -967,6 +979,7 @@ export default function App() {
             bankrollConfig={bankrollConfig}
             recentSpins={spins}
             onSaveConfig={handleSaveTelegramConfig}
+            onReconnect={handleReconnectTelegram}
             onDetectChats={handleDetectTelegramChats}
             onBroadcastPrediction={handleBroadcastTelegram}
             onSendCustomMessage={handleSendCustomTelegram}

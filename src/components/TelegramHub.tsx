@@ -48,11 +48,13 @@ interface TelegramHubProps {
     botToken?: string;
     chatId?: string;
     pollingActive?: boolean;
+    receiverMode?: 'webhook' | 'polling';
     autoBroadcastOnAppSpin?: boolean;
     autoBroadcastOnTelegramSpin?: boolean;
     includeFullStatsInBroadcast?: boolean;
     clearToken?: boolean;
   }) => Promise<{ ok: boolean; error?: string }>;
+  onReconnect?: () => Promise<boolean>;
   onDetectChats: () => Promise<TelegramDetectedChat[]>;
   onBroadcastPrediction: (customHeader?: string) => Promise<{ ok: boolean; error?: string }>;
   onSendCustomMessage: (message: string) => Promise<{ ok: boolean; error?: string }>;
@@ -71,6 +73,7 @@ export const TelegramHub: React.FC<TelegramHubProps> = ({
   bankrollConfig,
   recentSpins,
   onSaveConfig,
+  onReconnect,
   onDetectChats,
   onBroadcastPrediction,
   onSendCustomMessage,
@@ -87,6 +90,7 @@ export const TelegramHub: React.FC<TelegramHubProps> = ({
   const [simPreview, setSimPreview] = useState<string | null>(null);
 
   const [isSaving, setIsSaving] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
   const [isBroadcasting, setIsBroadcasting] = useState(false);
   const [isSendingCustom, setIsSendingCustom] = useState(false);
@@ -327,9 +331,37 @@ export const TelegramHub: React.FC<TelegramHubProps> = ({
             >
               <Radio className="w-3.5 h-3.5" />
               <span className="font-semibold whitespace-nowrap">
-                {telegramConfig.pollingActive ? 'รับเลขสดอัตโนมัติ (Active)' : 'โหมดรับเลขปิดอยู่'}
+                {telegramConfig.pollingActive
+                  ? telegramConfig.webhookActive
+                    ? 'รับเลข Webhook 24 ชม. (Active)'
+                    : 'รับเลข Polling สด (Active)'
+                  : 'โหมดรับเลขปิดอยู่'}
               </span>
             </div>
+
+            {onReconnect && telegramConfig.hasToken && (
+              <button
+                type="button"
+                disabled={isReconnecting}
+                onClick={async () => {
+                  setIsReconnecting(true);
+                  try {
+                    const ok = await onReconnect();
+                    if (ok) {
+                      showNotice('success', 'เชื่อมต่อ Telegram Bot ใหม่เรียบร้อยแล้ว!');
+                    } else {
+                      showNotice('error', 'กำลังลองเชื่อมต่อใหม่ในพื้นหลังอัตโนมัติ...');
+                    }
+                  } finally {
+                    setIsReconnecting(false);
+                  }
+                }}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl border bg-slate-950 hover:bg-slate-800 border-slate-700 text-slate-200 font-semibold whitespace-nowrap"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 text-sky-400 ${isReconnecting ? 'animate-spin' : ''}`} />
+                <span>เชื่อมต่อใหม่</span>
+              </button>
+            )}
           </div>
         </div>
 
@@ -556,7 +588,7 @@ export const TelegramHub: React.FC<TelegramHubProps> = ({
 
               <label className="flex items-center justify-between gap-3 p-2.5 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer hover:border-slate-700">
                 <div className="text-xs">
-                  <span className="font-semibold text-white block">เปิดดักฟังข้อความจาก Telegram (Polling)</span>
+                  <span className="font-semibold text-white block">เปิดรับเลขสดจาก Telegram ตลอดเวลา</span>
                   <span className="text-[11px] text-slate-400">รับคำสั่ง 0-36, /predict, /status จากแชท Telegram แบบต่อเนื่อง</span>
                 </div>
                 <input
@@ -566,6 +598,45 @@ export const TelegramHub: React.FC<TelegramHubProps> = ({
                   className="w-5 h-5 accent-sky-500 shrink-0"
                 />
               </label>
+
+              {/* Receiver Mode Selector: Webhook (Render) vs Polling (Local/Dev) */}
+              <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold text-white">โหมดการรับข้อมูลจาก Telegram</span>
+                  <span className="text-[10px] font-mono text-sky-300">
+                    {telegramConfig.webhookActive ? 'Webhook Push' : 'Long Polling'}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => onSaveConfig({ receiverMode: 'webhook', pollingActive: true })}
+                    className={`min-h-[38px] px-2 py-1.5 rounded-lg text-[11px] font-bold border transition-all ${
+                      telegramConfig.receiverMode === 'webhook'
+                        ? 'bg-emerald-600 text-slate-950 border-emerald-400'
+                        : 'bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800'
+                    }`}
+                  >
+                    Webhook (เสถียรสุดบน Render)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onSaveConfig({ receiverMode: 'polling', pollingActive: true })}
+                    className={`min-h-[38px] px-2 py-1.5 rounded-lg text-[11px] font-bold border transition-all ${
+                      telegramConfig.receiverMode !== 'webhook'
+                        ? 'bg-sky-500 text-slate-950 border-sky-400'
+                        : 'bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800'
+                    }`}
+                  >
+                    Polling (ใช้ได้ทุกเครื่อง)
+                  </button>
+                </div>
+                {!telegramConfig.hasEnvToken && telegramConfig.hasToken && (
+                  <p className="text-[10px] text-amber-300/90 leading-snug">
+                    แนะนำ: ใส่ <code className="text-amber-200">TELEGRAM_BOT_TOKEN</code> และ <code className="text-amber-200">TELEGRAM_CHAT_ID</code> ใน Render Environment ด้วย เพื่อไม่ให้ค่าหายเวลาเซิร์ฟเวอร์รีสตาร์ทครับ
+                  </p>
+                )}
+              </div>
             </div>
           </form>
         </div>

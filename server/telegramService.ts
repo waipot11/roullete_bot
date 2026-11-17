@@ -1,5 +1,6 @@
 import dns from 'dns';
 import fs from 'fs';
+import https from 'https';
 import path from 'path';
 import type {
   BankrollConfig,
@@ -23,6 +24,8 @@ interface InternalTelegramConfig {
   chatTitle: string;
   isConnected: boolean;
   pollingActive: boolean;
+  receiverMode: 'webhook' | 'polling';
+  webhookActive: boolean;
   autoBroadcastOnAppSpin: boolean;
   autoBroadcastOnTelegramSpin: boolean;
   includeFullStatsInBroadcast: boolean;
@@ -56,6 +59,8 @@ export class RouletteTelegramServerService {
     chatTitle: '',
     isConnected: false,
     pollingActive: Boolean(process.env.TELEGRAM_BOT_TOKEN),
+    receiverMode: 'polling',
+    webhookActive: false,
     autoBroadcastOnAppSpin: true,
     autoBroadcastOnTelegramSpin: true,
     includeFullStatsInBroadcast: true,
@@ -63,47 +68,72 @@ export class RouletteTelegramServerService {
     lastSyncAt: null
   };
 
+  private detectedPublicOrigin: string = '';
   private telegramLogs: TelegramLogEntry[] = [];
   private detectedChats: Map<string, TelegramDetectedChat> = new Map();
   private processedUpdateIds: Set<number> = new Set();
   private pollingOffset: number = 0;
   private pollingTimer: ReturnType<typeof setTimeout> | null = null;
-  private startupRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
   private isPollingRunning: boolean = false;
+  private pollGeneration: number = 0;
+  private pollConsecutiveFailures: number = 0;
+  private lastPollFinishAt: number = 0;
+  private lastWebhookCheckAt: number = 0;
   private listeners: Set<(event: { type: string; payload: ServerAppStatePayload; meta?: Record<string, unknown> }) => void> = new Set();
 
   constructor() {
     try {
       dns.setDefaultResultOrder('ipv4first');
     } catch {
-      // Ignore if unsupported in current runtime
+      // Ignore if unsupported
     }
+
+    const envUrl = (process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+    if (this.isPublicWebhookCapable(envUrl)) {
+      this.detectedPublicOrigin = envUrl;
+      this.telegramConfig.receiverMode = 'webhook';
+    }
+
     this.spins = generateInitialHistory(this.currentTableId, 60);
     this.loadSavedConfig();
+
+    // Start 30-second self-healing watchdog so bot never stays dead after transient network glitches
+    this.startWatchdog();
+
     if (this.telegramConfig.botToken) {
-      void this.bootstrapConnectionWithRetry();
+      this.telegramConfig.pollingActive = true;
+      void this.ensureConnectedAndReceiving();
     }
   }
 
-  private async bootstrapConnectionWithRetry() {
-    if (!this.telegramConfig.botToken) return;
-    const ok = await this.verifyBotConnection();
-    if (ok) {
-      if (this.startupRetryTimer) {
-        clearTimeout(this.startupRetryTimer);
-        this.startupRetryTimer = null;
-      }
-      if (this.telegramConfig.pollingActive) {
-        await this.callTelegramApi('deleteWebhook', { drop_pending_updates: false });
-        this.startPolling();
-      }
-      this.emitState('telegram:config_updated');
-    } else {
-      // Retry automatically after 10s in case container network/DNS was still warming up
-      if (this.startupRetryTimer) clearTimeout(this.startupRetryTimer);
-      this.startupRetryTimer = setTimeout(() => {
-        void this.bootstrapConnectionWithRetry();
-      }, 10000);
+  private isPublicWebhookCapable(url: string): boolean {
+    if (!url || !url.startsWith('https://')) return false;
+    const lower = url.toLowerCase();
+    if (lower.includes('localhost') || lower.includes('127.0.0.1') || lower.includes('ais-dev-')) {
+      return false;
+    }
+    return true;
+  }
+
+  private getEffectiveBaseUrl(): string {
+    const envUrl = (process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+    if (this.isPublicWebhookCapable(envUrl)) return envUrl;
+    if (this.isPublicWebhookCapable(this.detectedPublicOrigin)) return this.detectedPublicOrigin;
+    return '';
+  }
+
+  // Called by server.ts whenever an HTTPS request arrives from a public host (e.g. Render)
+  public registerPublicOrigin(origin: string) {
+    const clean = origin.replace(/\/$/, '');
+    if (!this.isPublicWebhookCapable(clean)) return;
+    const changed = this.detectedPublicOrigin !== clean;
+    this.detectedPublicOrigin = clean;
+
+    // Auto-upgrade to ultra-stable Webhook mode on Render if token is active and not explicitly forced off
+    if (changed && this.telegramConfig.botToken && this.telegramConfig.pollingActive && !this.telegramConfig.webhookActive) {
+      this.telegramConfig.receiverMode = 'webhook';
+      void this.ensureConnectedAndReceiving();
     }
   }
 
@@ -113,6 +143,7 @@ export class RouletteTelegramServerService {
         const raw = fs.readFileSync(CONFIG_FILE_PATH, 'utf-8');
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === 'object') {
+          const envBase = this.getEffectiveBaseUrl();
           this.telegramConfig = {
             ...this.telegramConfig,
             botToken: process.env.TELEGRAM_BOT_TOKEN || parsed.botToken || '',
@@ -122,7 +153,8 @@ export class RouletteTelegramServerService {
             autoBroadcastOnAppSpin: parsed.autoBroadcastOnAppSpin ?? true,
             autoBroadcastOnTelegramSpin: parsed.autoBroadcastOnTelegramSpin ?? true,
             includeFullStatsInBroadcast: parsed.includeFullStatsInBroadcast ?? true,
-            pollingActive: parsed.pollingActive ?? Boolean(process.env.TELEGRAM_BOT_TOKEN || parsed.botToken)
+            pollingActive: parsed.pollingActive ?? Boolean(process.env.TELEGRAM_BOT_TOKEN || parsed.botToken),
+            receiverMode: envBase ? (parsed.receiverMode || 'webhook') : 'polling'
           };
         }
       }
@@ -141,7 +173,8 @@ export class RouletteTelegramServerService {
         autoBroadcastOnAppSpin: this.telegramConfig.autoBroadcastOnAppSpin,
         autoBroadcastOnTelegramSpin: this.telegramConfig.autoBroadcastOnTelegramSpin,
         includeFullStatsInBroadcast: this.telegramConfig.includeFullStatsInBroadcast,
-        pollingActive: this.telegramConfig.pollingActive
+        pollingActive: this.telegramConfig.pollingActive,
+        receiverMode: this.telegramConfig.receiverMode
       };
       fs.writeFileSync(CONFIG_FILE_PATH, JSON.stringify(toSave, null, 2), 'utf-8');
     } catch {
@@ -183,21 +216,28 @@ export class RouletteTelegramServerService {
   }
 
   public getPublicTelegramConfig(): TelegramPublicConfig {
-    const appUrl = (process.env.APP_URL || '').replace(/\/$/, '');
+    const baseUrl = this.getEffectiveBaseUrl();
+    const isReceiving =
+      this.telegramConfig.pollingActive &&
+      (this.telegramConfig.webhookActive || this.isPollingRunning);
+
     return {
       hasToken: Boolean(this.telegramConfig.botToken),
+      hasEnvToken: Boolean(process.env.TELEGRAM_BOT_TOKEN),
       maskedToken: this.getMaskToken(this.telegramConfig.botToken),
       chatId: this.telegramConfig.chatId,
       botUsername: this.telegramConfig.botUsername,
       chatTitle: this.telegramConfig.chatTitle,
       isConnected: this.telegramConfig.isConnected,
-      pollingActive: this.isPollingRunning && this.telegramConfig.pollingActive,
+      pollingActive: isReceiving,
+      receiverMode: this.telegramConfig.receiverMode,
+      webhookActive: this.telegramConfig.webhookActive,
       autoBroadcastOnAppSpin: this.telegramConfig.autoBroadcastOnAppSpin,
       autoBroadcastOnTelegramSpin: this.telegramConfig.autoBroadcastOnTelegramSpin,
       includeFullStatsInBroadcast: this.telegramConfig.includeFullStatsInBroadcast,
       lastError: this.telegramConfig.lastError,
       lastSyncAt: this.telegramConfig.lastSyncAt,
-      webhookUrl: appUrl ? `${appUrl}/api/telegram/webhook` : '/api/telegram/webhook'
+      webhookUrl: baseUrl ? `${baseUrl}/api/telegram/webhook` : '/api/telegram/webhook'
     };
   }
 
@@ -494,58 +534,119 @@ export class RouletteTelegramServerService {
       .replace(/>/g, '&gt;');
   }
 
+  // Dedicated IPv4 node:https request without stale keep-alive socket pooling (eliminates 5-min undici "fetch failed" drops)
+  private singleHttpsPost<T>(
+    token: string,
+    method: string,
+    payloadJson: string | null,
+    timeoutMs: number
+  ): Promise<{ ok: boolean; result?: T; description?: string; error_code?: number; isNetworkError?: boolean }> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (val: { ok: boolean; result?: T; description?: string; error_code?: number; isNetworkError?: boolean }) => {
+        if (!settled) {
+          settled = true;
+          resolve(val);
+        }
+      };
+
+      const headers: Record<string, string | number> = {
+        Accept: 'application/json'
+      };
+      if (payloadJson !== null) {
+        headers['Content-Type'] = 'application/json';
+        headers['Content-Length'] = Buffer.byteLength(payloadJson);
+      }
+
+      const req = https.request(
+        {
+          hostname: 'api.telegram.org',
+          port: 443,
+          path: `/bot${token}/${method}`,
+          method: 'POST',
+          family: 4,
+          agent: false, // Fresh clean TLS socket per request (no stale NAT keep-alive sockets!)
+          headers
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          res.on('end', () => {
+            try {
+              const text = Buffer.concat(chunks).toString('utf8');
+              const parsed = JSON.parse(text) as {
+                ok: boolean;
+                result?: T;
+                description?: string;
+                error_code?: number;
+              };
+              finish(parsed);
+            } catch {
+              finish({
+                ok: false,
+                description: `Telegram ตอบกลับผิดพลาด (HTTP ${res.statusCode || 0})`,
+                isNetworkError: true
+              });
+            }
+          });
+        }
+      );
+
+      req.setTimeout(timeoutMs, () => {
+        req.destroy(new Error(`Request timeout (${Math.round(timeoutMs / 1000)}s)`));
+      });
+
+      req.on('error', (err: NodeJS.ErrnoException) => {
+        const code = err?.code ? ` (${err.code})` : '';
+        finish({
+          ok: false,
+          description: `เชื่อมต่อ Telegram ไม่สำเร็จ: ${err.message || 'Network error'}${code}`,
+          isNetworkError: true
+        });
+      });
+
+      if (payloadJson !== null) {
+        req.write(payloadJson);
+      }
+      req.end();
+    });
+  }
+
   public async callTelegramApi<T = unknown>(
     method: string,
     body?: Record<string, unknown>,
     tokenOverride?: string
-  ): Promise<{ ok: boolean; result?: T; description?: string; error_code?: number }> {
+  ): Promise<{ ok: boolean; result?: T; description?: string; error_code?: number; isNetworkError?: boolean }> {
     const token = tokenOverride ?? this.telegramConfig.botToken;
     if (!token) {
       return { ok: false, description: 'ยังไม่ได้ตั้งค่า Telegram Bot Token' };
     }
 
+    const payloadJson = body ? JSON.stringify(body) : null;
     const isLongPoll = method === 'getUpdates' && typeof body?.timeout === 'number' && body.timeout > 0;
-    const timeoutMs = isLongPoll ? (Number(body?.timeout) + 10) * 1000 : 12000;
-    const maxAttempts = isLongPoll ? 1 : 2;
+    const timeoutMs = isLongPoll ? (Number(body?.timeout) + 8) * 1000 : 12000;
+    const maxAttempts = isLongPoll ? 1 : 3;
+
+    let lastRes: { ok: boolean; result?: T; description?: string; error_code?: number; isNetworkError?: boolean } = {
+      ok: false,
+      description: 'เชื่อมต่อ Telegram ไม่สำเร็จ',
+      isNetworkError: true
+    };
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const res = await this.singleHttpsPost<T>(token, method, payloadJson, timeoutMs);
+      lastRes = res;
 
-      try {
-        const resp = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: body ? JSON.stringify(body) : undefined,
-          signal: controller.signal
-        });
-        clearTimeout(timer);
-        const data = (await resp.json()) as {
-          ok: boolean;
-          result?: T;
-          description?: string;
-          error_code?: number;
-        };
-        return data;
-      } catch (err) {
-        clearTimeout(timer);
-        const cause = err && typeof err === 'object' && 'cause' in err ? (err as { cause?: { code?: string; message?: string } }).cause : undefined;
-        const code = cause?.code ? ` (${cause.code})` : '';
-        const msg = err instanceof Error ? err.message : 'Network error calling Telegram API';
+      if (res.ok || !res.isNetworkError) {
+        return res;
+      }
 
-        if (attempt < maxAttempts) {
-          await new Promise((r) => setTimeout(r, 800));
-          continue;
-        }
-
-        return {
-          ok: false,
-          description: `เชื่อมต่อ api.telegram.org ไม่สำเร็จ: ${msg}${code}`
-        };
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, attempt * 600));
       }
     }
 
-    return { ok: false, description: 'เชื่อมต่อ api.telegram.org ไม่สำเร็จ' };
+    return lastRes;
   }
 
   public async verifyBotConnection(): Promise<boolean> {
@@ -563,41 +664,126 @@ export class RouletteTelegramServerService {
       this.saveConfigToDisk();
       return true;
     } else {
-      this.telegramConfig.isConnected = false;
+      // Only mark disconnected if token is genuinely invalid (401/404) or not previously connected
+      if (res.error_code === 401 || res.error_code === 404 || !this.telegramConfig.isConnected) {
+        this.telegramConfig.isConnected = false;
+      }
       this.telegramConfig.lastError = res.description || 'ไม่สามารถเชื่อมต่อกับ Telegram Bot ได้';
       return false;
     }
+  }
+
+  // Ensures the optimal receiver (Webhook on Render, Polling on local/dev) is active
+  public async ensureConnectedAndReceiving(): Promise<boolean> {
+    if (!this.telegramConfig.botToken) return false;
+
+    const ok = await this.verifyBotConnection();
+    if (!ok) {
+      this.emitState('telegram:config_updated');
+      return false;
+    }
+
+    if (this.telegramConfig.chatId) {
+      const chatRes = await this.callTelegramApi<{ title?: string; username?: string; first_name?: string }>(
+        'getChat',
+        { chat_id: this.telegramConfig.chatId }
+      );
+      if (chatRes.ok && chatRes.result) {
+        this.telegramConfig.chatTitle =
+          chatRes.result.title || chatRes.result.username || chatRes.result.first_name || this.telegramConfig.chatId;
+      }
+    }
+
+    if (!this.telegramConfig.pollingActive) {
+      this.stopPolling();
+      this.telegramConfig.webhookActive = false;
+      this.saveConfigToDisk();
+      this.emitState('telegram:config_updated');
+      return true;
+    }
+
+    const baseUrl = this.getEffectiveBaseUrl();
+    if (this.telegramConfig.receiverMode === 'webhook' && baseUrl) {
+      const webhookUrl = `${baseUrl}/api/telegram/webhook`;
+      const setRes = await this.callTelegramApi('setWebhook', {
+        url: webhookUrl,
+        allowed_updates: ['message', 'channel_post'],
+        drop_pending_updates: false
+      });
+
+      if (setRes.ok) {
+        this.stopPolling(true); // Stop polling loop while keeping pollingActive=true (receiving via webhook!)
+        this.telegramConfig.webhookActive = true;
+        this.telegramConfig.lastError = null;
+        this.lastWebhookCheckAt = Date.now();
+        this.saveConfigToDisk();
+        this.emitState('telegram:config_updated');
+        return true;
+      }
+      // Fallback gracefully to polling if setWebhook fails
+      this.telegramConfig.receiverMode = 'polling';
+      this.telegramConfig.webhookActive = false;
+    }
+
+    // Polling mode (local dev / AI Studio preview / webhook fallback)
+    this.telegramConfig.webhookActive = false;
+    await this.callTelegramApi('deleteWebhook', { drop_pending_updates: false });
+    this.startPolling();
+    this.saveConfigToDisk();
+    this.emitState('telegram:config_updated');
+    return true;
   }
 
   public async updateTelegramConfig(input: {
     botToken?: string;
     chatId?: string;
     pollingActive?: boolean;
+    receiverMode?: 'webhook' | 'polling';
     autoBroadcastOnAppSpin?: boolean;
     autoBroadcastOnTelegramSpin?: boolean;
     includeFullStatsInBroadcast?: boolean;
     clearToken?: boolean;
   }) {
+    let needsReceiverRebind = false;
+
     if (input.clearToken) {
-      this.stopPolling();
+      this.stopPolling(false);
       this.telegramConfig.botToken = '';
       this.telegramConfig.botUsername = '';
       this.telegramConfig.isConnected = false;
+      this.telegramConfig.webhookActive = false;
       this.telegramConfig.lastError = null;
-    } else if (typeof input.botToken === 'string' && input.botToken.trim().length > 0) {
+      this.saveConfigToDisk();
+      this.emitState('telegram:config_updated');
+      return this.getPublicTelegramConfig();
+    }
+
+    if (typeof input.botToken === 'string' && input.botToken.trim().length > 0) {
       const cleanToken = input.botToken.trim();
       if (cleanToken !== this.telegramConfig.botToken) {
-        this.stopPolling();
+        this.stopPolling(false);
         this.telegramConfig.botToken = cleanToken;
         this.pollingOffset = 0;
+        needsReceiverRebind = true;
       }
     }
 
     if (typeof input.chatId === 'string') {
-      this.telegramConfig.chatId = input.chatId.trim();
-      const detected = this.detectedChats.get(this.telegramConfig.chatId);
-      if (detected) {
-        this.telegramConfig.chatTitle = detected.title;
+      const trimmedChat = input.chatId.trim();
+      if (trimmedChat !== this.telegramConfig.chatId) {
+        this.telegramConfig.chatId = trimmedChat;
+        const detected = this.detectedChats.get(trimmedChat);
+        if (detected) {
+          this.telegramConfig.chatTitle = detected.title;
+        }
+        needsReceiverRebind = true;
+      }
+    }
+
+    if (typeof input.receiverMode === 'string' && (input.receiverMode === 'webhook' || input.receiverMode === 'polling')) {
+      if (input.receiverMode !== this.telegramConfig.receiverMode) {
+        this.telegramConfig.receiverMode = input.receiverMode;
+        needsReceiverRebind = true;
       }
     }
 
@@ -610,35 +796,19 @@ export class RouletteTelegramServerService {
     if (typeof input.includeFullStatsInBroadcast === 'boolean') {
       this.telegramConfig.includeFullStatsInBroadcast = input.includeFullStatsInBroadcast;
     }
-    if (typeof input.pollingActive === 'boolean') {
+    if (typeof input.pollingActive === 'boolean' && input.pollingActive !== this.telegramConfig.pollingActive) {
       this.telegramConfig.pollingActive = input.pollingActive;
+      needsReceiverRebind = true;
     }
 
-    if (this.telegramConfig.botToken) {
-      const ok = await this.verifyBotConnection();
-      if (ok && this.telegramConfig.chatId) {
-        const chatRes = await this.callTelegramApi<{ title?: string; username?: string; first_name?: string }>(
-          'getChat',
-          { chat_id: this.telegramConfig.chatId }
-        );
-        if (chatRes.ok && chatRes.result) {
-          this.telegramConfig.chatTitle =
-            chatRes.result.title || chatRes.result.username || chatRes.result.first_name || this.telegramConfig.chatId;
-        }
-      }
-      if (ok && this.telegramConfig.pollingActive) {
-        // Ensure any stale webhook is cleared before long polling
-        await this.callTelegramApi('deleteWebhook', { drop_pending_updates: false });
-        this.startPolling();
-      } else {
-        this.stopPolling();
-      }
+    // Only re-bind Telegram connection if connection settings actually changed or bot is currently disconnected
+    if (this.telegramConfig.botToken && (needsReceiverRebind || !this.telegramConfig.isConnected)) {
+      await this.ensureConnectedAndReceiving();
     } else {
-      this.stopPolling();
+      this.saveConfigToDisk();
+      this.emitState('telegram:config_updated');
     }
 
-    this.saveConfigToDisk();
-    this.emitState('telegram:config_updated');
     return this.getPublicTelegramConfig();
   }
 
@@ -671,6 +841,7 @@ export class RouletteTelegramServerService {
     });
 
     if (res.ok) {
+      this.telegramConfig.isConnected = true;
       this.telegramConfig.lastError = null;
       this.telegramConfig.lastSyncAt = Date.now();
       this.addLog({
@@ -688,7 +859,7 @@ export class RouletteTelegramServerService {
       this.addLog({
         direction: 'outgoing',
         eventType: 'error',
-        text: `${errMsg}`,
+        text: errMsg,
         chatId: targetChatId,
         success: false
       });
@@ -791,6 +962,11 @@ export class RouletteTelegramServerService {
     if (!msg || !msg.text || !msg.chat) return { handled: false };
     if ('from' in msg && msg.from?.is_bot) return { handled: false };
 
+    // Mark healthy on inbound update
+    this.telegramConfig.isConnected = true;
+    this.telegramConfig.lastError = null;
+    this.telegramConfig.lastSyncAt = Date.now();
+
     const chatIdStr = String(msg.chat.id);
     const chatTitle = msg.chat.title || msg.chat.username || msg.chat.first_name || chatIdStr;
     const senderName =
@@ -806,7 +982,6 @@ export class RouletteTelegramServerService {
       timestamp: Date.now()
     });
 
-    // If chatId is configured, only process spin commands from configured chat (or private admin testing); if not yet set, auto-bind first group or allow detection
     if (this.telegramConfig.chatId && chatIdStr !== this.telegramConfig.chatId) {
       this.emitState('telegram:chat_detected');
       return { handled: false };
@@ -818,7 +993,6 @@ export class RouletteTelegramServerService {
       return { handled: false };
     }
 
-    this.telegramConfig.lastSyncAt = Date.now();
     const replyChatId = chatIdStr;
 
     if (parsed.type === 'help_cmd') {
@@ -918,12 +1092,10 @@ export class RouletteTelegramServerService {
           number: n,
           source: 'telegram',
           telegramSender: senderName,
-          // Only broadcast back to Telegram on the last number of the message
           skipBroadcast: !isLast
         });
       }
 
-      // If no chatId was saved yet, reply directly to the chat that sent the number if autoBroadcast is enabled
       if (!this.telegramConfig.chatId && this.telegramConfig.autoBroadcastOnTelegramSpin && lastOutcome) {
         const msgHtml = this.formatPredictionMessageHtml({
           lastSpin: lastOutcome.spin,
@@ -940,9 +1112,32 @@ export class RouletteTelegramServerService {
     return { handled: false };
   }
 
-  // Trigger a one-shot getUpdates scan to detect chats even if polling wasn't running
+  // Trigger a scan to detect chats; safely preserves active webhook if needed
   public async scanForChats(): Promise<TelegramDetectedChat[]> {
     if (!this.telegramConfig.botToken) return [];
+
+    // Also resolve configured chatId directly via getChat so it's always visible
+    if (this.telegramConfig.chatId) {
+      const chatRes = await this.callTelegramApi<{ title?: string; username?: string; first_name?: string; type?: 'group' | 'supergroup' | 'channel' | 'private' }>(
+        'getChat',
+        { chat_id: this.telegramConfig.chatId }
+      );
+      if (chatRes.ok && chatRes.result) {
+        const title = chatRes.result.title || chatRes.result.username || chatRes.result.first_name || this.telegramConfig.chatId;
+        this.telegramConfig.chatTitle = title;
+        if (!this.detectedChats.has(this.telegramConfig.chatId)) {
+          this.detectedChats.set(this.telegramConfig.chatId, {
+            chatId: this.telegramConfig.chatId,
+            title,
+            type: chatRes.result.type || 'supergroup',
+            lastMessageText: '(กลุ่มที่เชื่อมต่อไว้)',
+            lastSender: 'ระบบ',
+            timestamp: Date.now()
+          });
+        }
+      }
+    }
+
     const res = await this.callTelegramApi<
       Array<{
         update_id: number;
@@ -971,32 +1166,79 @@ export class RouletteTelegramServerService {
           });
         }
       }
-    } else if (res.error_code === 409) {
-      // Webhook conflict — clear webhook and retry
+    } else if (res.error_code === 409 && this.detectedChats.size === 0) {
+      // Temporarily pause webhook to scan updates once, then immediately restore webhook
       await this.callTelegramApi('deleteWebhook', { drop_pending_updates: false });
+      const retryRes = await this.callTelegramApi<
+        Array<{
+          update_id: number;
+          message?: {
+            text?: string;
+            from?: { id: number; is_bot?: boolean; first_name?: string; username?: string };
+            chat?: { id: number; title?: string; username?: string; first_name?: string; type: 'group' | 'supergroup' | 'channel' | 'private' };
+          };
+        }>
+      >('getUpdates', { offset: this.pollingOffset, limit: 30, timeout: 0 });
+
+      if (retryRes.ok && Array.isArray(retryRes.result)) {
+        for (const upd of retryRes.result) {
+          if (upd.message?.chat) {
+            const c = upd.message.chat;
+            const chatIdStr = String(c.id);
+            const title = c.title || c.username || c.first_name || chatIdStr;
+            const sender = upd.message.from?.first_name || upd.message.from?.username || 'สมาชิก';
+            this.detectedChats.set(chatIdStr, {
+              chatId: chatIdStr,
+              title,
+              type: c.type,
+              lastMessageText: upd.message.text?.slice(0, 80) || '(ข้อความระบบ)',
+              lastSender: sender,
+              timestamp: Date.now()
+            });
+          }
+        }
+      }
+
+      if (this.telegramConfig.receiverMode === 'webhook') {
+        const baseUrl = this.getEffectiveBaseUrl();
+        if (baseUrl) {
+          await this.callTelegramApi('setWebhook', {
+            url: `${baseUrl}/api/telegram/webhook`,
+            allowed_updates: ['message', 'channel_post'],
+            drop_pending_updates: false
+          });
+        }
+      }
     }
 
     return this.getDetectedChats();
   }
 
   public startPolling() {
-    if (this.isPollingRunning || !this.telegramConfig.botToken) return;
+    if (!this.telegramConfig.botToken) return;
+    if (this.isPollingRunning) return;
     this.isPollingRunning = true;
     this.telegramConfig.pollingActive = true;
-    void this.pollTick();
+    this.pollConsecutiveFailures = 0;
+    this.pollGeneration += 1;
+    this.lastPollFinishAt = Date.now();
+    void this.pollTick(this.pollGeneration);
   }
 
-  public stopPolling() {
+  public stopPolling(keepDesiredActive: boolean = false) {
     this.isPollingRunning = false;
-    this.telegramConfig.pollingActive = false;
+    this.pollGeneration += 1;
+    if (!keepDesiredActive) {
+      this.telegramConfig.pollingActive = false;
+    }
     if (this.pollingTimer) {
       clearTimeout(this.pollingTimer);
       this.pollingTimer = null;
     }
   }
 
-  private async pollTick() {
-    if (!this.isPollingRunning || !this.telegramConfig.botToken) return;
+  private async pollTick(gen: number) {
+    if (!this.isPollingRunning || gen !== this.pollGeneration || !this.telegramConfig.botToken) return;
 
     try {
       const res = await this.callTelegramApi<
@@ -1013,42 +1255,107 @@ export class RouletteTelegramServerService {
             message_id?: number;
             text?: string;
             date?: number;
-            chat?: { id: number; title?: string; username?: string; type: 'channel' };
+            chat?: { id: number; title?: string; username?: string; first_name?: string; type: 'channel' };
           };
         }>
       >('getUpdates', {
         offset: this.pollingOffset,
-        timeout: 15,
+        timeout: 10,
         allowed_updates: ['message', 'channel_post']
       });
 
-      if (!this.isPollingRunning) return;
+      this.lastPollFinishAt = Date.now();
+      if (!this.isPollingRunning || gen !== this.pollGeneration) return;
 
       if (res.ok && Array.isArray(res.result)) {
+        this.pollConsecutiveFailures = 0;
         const hadError = Boolean(this.telegramConfig.lastError) || !this.telegramConfig.isConnected;
         this.telegramConfig.isConnected = true;
         this.telegramConfig.lastError = null;
         if (hadError) {
           this.emitState('telegram:config_updated');
         }
+
         for (const upd of res.result) {
           this.pollingOffset = Math.max(this.pollingOffset, upd.update_id + 1);
           await this.handleTelegramUpdate(upd);
         }
       } else if (res.error_code === 409) {
-        // Webhook active conflict; delete webhook so long polling works automatically
+        this.pollConsecutiveFailures = 0;
         await this.callTelegramApi('deleteWebhook', { drop_pending_updates: false });
-      } else if (!res.ok && res.description) {
-        this.telegramConfig.lastError = res.description;
+      } else if (!res.ok) {
+        this.pollConsecutiveFailures += 1;
+        // Only display error after 2+ consecutive failures to avoid flashing on minor blips
+        if (this.pollConsecutiveFailures >= 2 && res.description) {
+          this.telegramConfig.lastError = res.description;
+          this.emitState('telegram:config_updated');
+        }
       }
     } catch {
-      // Network hiccup; retry shortly
+      this.lastPollFinishAt = Date.now();
+      this.pollConsecutiveFailures += 1;
     }
 
-    if (this.isPollingRunning) {
+    if (this.isPollingRunning && gen === this.pollGeneration) {
+      // Exponential backoff on consecutive failures (800ms -> 2s -> 4s -> 8s max)
+      const delay =
+        this.pollConsecutiveFailures === 0
+          ? 500
+          : Math.min(8000, 1000 * Math.pow(2, Math.min(3, this.pollConsecutiveFailures - 1)));
       this.pollingTimer = setTimeout(() => {
-        void this.pollTick();
-      }, 600);
+        void this.pollTick(gen);
+      }, delay);
+    }
+  }
+
+  private startWatchdog() {
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.watchdogTimer = setInterval(() => {
+      void this.runHealthWatchdog();
+    }, 30000);
+  }
+
+  private async runHealthWatchdog() {
+    if (!this.telegramConfig.botToken) return;
+
+    // 1. Recover if startup failed or bot got marked disconnected by transient error
+    if (!this.telegramConfig.isConnected && !String(this.telegramConfig.lastError || '').includes('Unauthorized')) {
+      await this.ensureConnectedAndReceiving();
+      return;
+    }
+
+    if (!this.telegramConfig.pollingActive) return;
+
+    // 2. Webhook watchdog: verify webhook every 2 minutes & auto-re-register if missing
+    if (this.telegramConfig.receiverMode === 'webhook') {
+      const baseUrl = this.getEffectiveBaseUrl();
+      if (baseUrl && Date.now() - this.lastWebhookCheckAt >= 120000) {
+        this.lastWebhookCheckAt = Date.now();
+        const expectedUrl = `${baseUrl}/api/telegram/webhook`;
+        const info = await this.callTelegramApi<{ url?: string; last_error_message?: string }>('getWebhookInfo');
+        if (info.ok && info.result) {
+          this.telegramConfig.isConnected = true;
+          if (info.result.url !== expectedUrl) {
+            await this.callTelegramApi('setWebhook', {
+              url: expectedUrl,
+              allowed_updates: ['message', 'channel_post'],
+              drop_pending_updates: false
+            });
+          }
+          if (this.telegramConfig.lastError) {
+            this.telegramConfig.lastError = null;
+            this.emitState('telegram:config_updated');
+          }
+        }
+      }
+      return;
+    }
+
+    // 3. Polling watchdog: restart poll loop if stalled > 35s
+    if (!this.isPollingRunning || Date.now() - this.lastPollFinishAt > 35000) {
+      this.stopPolling(true);
+      this.startPolling();
+      this.emitState('telegram:config_updated');
     }
   }
 }

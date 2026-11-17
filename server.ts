@@ -77,6 +77,19 @@ async function bootstrap() {
   // ---------------------------------------------------------------------------
   // REST API Routes
   // ---------------------------------------------------------------------------
+  // Auto-detect public HTTPS origin (e.g. Render.com) to enable reliable Telegram Webhook mode
+  app.use((req, _res, next) => {
+    const protoHeader = req.headers['x-forwarded-proto'];
+    const proto = Array.isArray(protoHeader) ? protoHeader[0] : protoHeader;
+    const fwdHostHeader = req.headers['x-forwarded-host'];
+    const fwdHost = Array.isArray(fwdHostHeader) ? fwdHostHeader[0] : fwdHostHeader;
+    const host = fwdHost || req.headers.host;
+    if (proto === 'https' && host) {
+      telegramService.registerPublicOrigin(`https://${host}`);
+    }
+    next();
+  });
+
   app.get('/api/health', (_req, res) => {
     res.json({
       ok: true,
@@ -163,6 +176,8 @@ async function bootstrap() {
       botToken: typeof body.botToken === 'string' ? body.botToken : undefined,
       chatId: typeof body.chatId === 'string' ? body.chatId : undefined,
       pollingActive: typeof body.pollingActive === 'boolean' ? body.pollingActive : undefined,
+      receiverMode:
+        body.receiverMode === 'webhook' || body.receiverMode === 'polling' ? body.receiverMode : undefined,
       autoBroadcastOnAppSpin:
         typeof body.autoBroadcastOnAppSpin === 'boolean' ? body.autoBroadcastOnAppSpin : undefined,
       autoBroadcastOnTelegramSpin:
@@ -175,6 +190,14 @@ async function bootstrap() {
     res.json({
       ok: true,
       telegramConfig: config,
+      state: telegramService.getPublicState(),
+    });
+  });
+
+  app.post('/api/telegram/reconnect', async (_req, res) => {
+    const ok = await telegramService.ensureConnectedAndReceiving();
+    res.json({
+      ok,
       state: telegramService.getPublicState(),
     });
   });
@@ -232,26 +255,31 @@ async function bootstrap() {
   });
 
   app.post('/api/telegram/set-webhook', async (req, res) => {
-    const baseUrl = (process.env.APP_URL || req.body?.baseUrl || '').replace(/\/$/, '');
-    if (!baseUrl || !baseUrl.startsWith('https://')) {
+    const protoHeader = req.headers['x-forwarded-proto'];
+    const proto = Array.isArray(protoHeader) ? protoHeader[0] : protoHeader;
+    const fwdHostHeader = req.headers['x-forwarded-host'];
+    const fwdHost = Array.isArray(fwdHostHeader) ? fwdHostHeader[0] : fwdHostHeader;
+    const host = fwdHost || req.headers.host;
+    const reqOrigin = proto === 'https' && host ? `https://${host}` : '';
+    const baseUrl = (process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || req.body?.baseUrl || reqOrigin || '').replace(/\/$/, '');
+
+    if (!baseUrl || !baseUrl.startsWith('https://') || baseUrl.includes('localhost') || baseUrl.includes('ais-dev-')) {
       res.status(400).json({
         ok: false,
-        error: 'Webhook ต้องใช้ HTTPS URL สาธารณะ (สำหรับระบบพัฒนา ใช้โหมด Polling อัตโนมัติได้เลยไม่ต้องตั้ง Webhook)',
+        error: 'Webhook ต้องใช้ HTTPS URL สาธารณะ (เช่น Render.com)',
       });
       return;
     }
 
-    const webhookUrl = `${baseUrl}/api/telegram/webhook`;
-    telegramService.stopPolling();
-    const apiRes = await telegramService.callTelegramApi('setWebhook', {
-      url: webhookUrl,
-      allowed_updates: ['message', 'channel_post'],
+    telegramService.registerPublicOrigin(baseUrl);
+    const config = await telegramService.updateTelegramConfig({
+      receiverMode: 'webhook',
+      pollingActive: true,
     });
 
     res.json({
-      ok: apiRes.ok,
-      description: apiRes.description,
-      webhookUrl,
+      ok: Boolean(config.webhookActive),
+      webhookUrl: config.webhookUrl,
       state: telegramService.getPublicState(),
     });
   });
