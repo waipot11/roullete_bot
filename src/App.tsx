@@ -195,13 +195,24 @@ export default function App() {
       }
     };
 
+    let pingTimer: ReturnType<typeof setInterval> | null = null;
+
     const connectWs = () => {
       if (!isMounted || typeof window === 'undefined') return;
+      if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
       socket.onopen = () => {
         if (isMounted) setWsConnected(true);
+        if (pingTimer) clearInterval(pingTimer);
+        pingTimer = setInterval(() => {
+          if (socket?.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: 'ping' }));
+          }
+        }, 25000);
       };
 
       socket.onmessage = (event) => {
@@ -217,6 +228,7 @@ export default function App() {
               telegramSender?: string;
             };
           };
+          if (msg.type === 'pong') return;
           if (msg.payload) {
             applyServerState(msg.payload);
           }
@@ -235,7 +247,11 @@ export default function App() {
       socket.onclose = () => {
         if (!isMounted) return;
         setWsConnected(false);
-        reconnectTimer = setTimeout(connectWs, 3000);
+        if (pingTimer) {
+          clearInterval(pingTimer);
+          pingTimer = null;
+        }
+        reconnectTimer = setTimeout(connectWs, 1500);
       };
 
       socket.onerror = () => {
@@ -243,12 +259,24 @@ export default function App() {
       };
     };
 
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && isMounted) {
+        void hydrate();
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          connectWs();
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
     void hydrate();
     connectWs();
 
     return () => {
       isMounted = false;
+      document.removeEventListener('visibilitychange', handleVisibility);
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (pingTimer) clearInterval(pingTimer);
       socket?.close();
     };
   }, [applyServerState, playTone, showToast]);

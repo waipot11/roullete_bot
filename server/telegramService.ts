@@ -1,3 +1,4 @@
+import dns from 'dns';
 import fs from 'fs';
 import path from 'path';
 import type {
@@ -67,18 +68,42 @@ export class RouletteTelegramServerService {
   private processedUpdateIds: Set<number> = new Set();
   private pollingOffset: number = 0;
   private pollingTimer: ReturnType<typeof setTimeout> | null = null;
+  private startupRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private isPollingRunning: boolean = false;
   private listeners: Set<(event: { type: string; payload: ServerAppStatePayload; meta?: Record<string, unknown> }) => void> = new Set();
 
   constructor() {
+    try {
+      dns.setDefaultResultOrder('ipv4first');
+    } catch {
+      // Ignore if unsupported in current runtime
+    }
     this.spins = generateInitialHistory(this.currentTableId, 60);
     this.loadSavedConfig();
     if (this.telegramConfig.botToken) {
-      void this.verifyBotConnection().then((ok) => {
-        if (ok && this.telegramConfig.pollingActive) {
-          this.startPolling();
-        }
-      });
+      void this.bootstrapConnectionWithRetry();
+    }
+  }
+
+  private async bootstrapConnectionWithRetry() {
+    if (!this.telegramConfig.botToken) return;
+    const ok = await this.verifyBotConnection();
+    if (ok) {
+      if (this.startupRetryTimer) {
+        clearTimeout(this.startupRetryTimer);
+        this.startupRetryTimer = null;
+      }
+      if (this.telegramConfig.pollingActive) {
+        await this.callTelegramApi('deleteWebhook', { drop_pending_updates: false });
+        this.startPolling();
+      }
+      this.emitState('telegram:config_updated');
+    } else {
+      // Retry automatically after 10s in case container network/DNS was still warming up
+      if (this.startupRetryTimer) clearTimeout(this.startupRetryTimer);
+      this.startupRetryTimer = setTimeout(() => {
+        void this.bootstrapConnectionWithRetry();
+      }, 10000);
     }
   }
 
@@ -479,25 +504,48 @@ export class RouletteTelegramServerService {
       return { ok: false, description: 'ยังไม่ได้ตั้งค่า Telegram Bot Token' };
     }
 
-    try {
-      const resp = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: body ? JSON.stringify(body) : undefined
-      });
-      const data = (await resp.json()) as {
-        ok: boolean;
-        result?: T;
-        description?: string;
-        error_code?: number;
-      };
-      return data;
-    } catch (err) {
-      return {
-        ok: false,
-        description: err instanceof Error ? err.message : 'Network error calling Telegram API'
-      };
+    const isLongPoll = method === 'getUpdates' && typeof body?.timeout === 'number' && body.timeout > 0;
+    const timeoutMs = isLongPoll ? (Number(body?.timeout) + 10) * 1000 : 12000;
+    const maxAttempts = isLongPoll ? 1 : 2;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const resp = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: controller.signal
+        });
+        clearTimeout(timer);
+        const data = (await resp.json()) as {
+          ok: boolean;
+          result?: T;
+          description?: string;
+          error_code?: number;
+        };
+        return data;
+      } catch (err) {
+        clearTimeout(timer);
+        const cause = err && typeof err === 'object' && 'cause' in err ? (err as { cause?: { code?: string; message?: string } }).cause : undefined;
+        const code = cause?.code ? ` (${cause.code})` : '';
+        const msg = err instanceof Error ? err.message : 'Network error calling Telegram API';
+
+        if (attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 800));
+          continue;
+        }
+
+        return {
+          ok: false,
+          description: `เชื่อมต่อ api.telegram.org ไม่สำเร็จ: ${msg}${code}`
+        };
+      }
     }
+
+    return { ok: false, description: 'เชื่อมต่อ api.telegram.org ไม่สำเร็จ' };
   }
 
   public async verifyBotConnection(): Promise<boolean> {
@@ -977,6 +1025,12 @@ export class RouletteTelegramServerService {
       if (!this.isPollingRunning) return;
 
       if (res.ok && Array.isArray(res.result)) {
+        const hadError = Boolean(this.telegramConfig.lastError) || !this.telegramConfig.isConnected;
+        this.telegramConfig.isConnected = true;
+        this.telegramConfig.lastError = null;
+        if (hadError) {
+          this.emitState('telegram:config_updated');
+        }
         for (const upd of res.result) {
           this.pollingOffset = Math.max(this.pollingOffset, upd.update_id + 1);
           await this.handleTelegramUpdate(upd);

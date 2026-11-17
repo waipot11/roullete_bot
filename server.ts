@@ -33,12 +33,45 @@ async function bootstrap() {
   });
 
   wss.on('connection', (ws) => {
+    (ws as WebSocket & { isAlive?: boolean }).isAlive = true;
+    ws.on('pong', () => {
+      (ws as WebSocket & { isAlive?: boolean }).isAlive = true;
+    });
+    ws.on('message', (raw) => {
+      try {
+        const parsed = JSON.parse(String(raw)) as { type?: string };
+        if (parsed?.type === 'ping' && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+        }
+      } catch {
+        // Ignore invalid client messages
+      }
+    });
     ws.send(
       JSON.stringify({
         type: 'state:init',
         payload: telegramService.getPublicState(),
       })
     );
+  });
+
+  // Keep WebSocket connections alive across cloud proxies (e.g. Render.com)
+  const wsHeartbeat = setInterval(() => {
+    wss.clients.forEach((client) => {
+      const tracked = client as WebSocket & { isAlive?: boolean };
+      if (tracked.isAlive === false) {
+        tracked.terminate();
+        return;
+      }
+      tracked.isAlive = false;
+      if (client.readyState === WebSocket.OPEN) {
+        client.ping();
+      }
+    });
+  }, 25000);
+
+  wss.on('close', () => {
+    clearInterval(wsHeartbeat);
   });
 
   // ---------------------------------------------------------------------------
