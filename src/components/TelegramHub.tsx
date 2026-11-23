@@ -38,6 +38,7 @@ interface TelegramHubProps {
   telegramLogs: TelegramLogEntry[];
   detectedChats: TelegramDetectedChat[];
   wsConnected: boolean;
+  syncTransport?: 'ws' | 'http';
   prediction: PredictionResult;
   rowStats: RowColumnStats;
   selectedStrategy: StrategyTier;
@@ -66,6 +67,7 @@ export const TelegramHub: React.FC<TelegramHubProps> = ({
   telegramLogs,
   detectedChats,
   wsConnected,
+  syncTransport = 'ws',
   prediction,
   rowStats,
   selectedStrategy,
@@ -318,7 +320,13 @@ export const TelegramHub: React.FC<TelegramHubProps> = ({
             >
               <Wifi className="w-3.5 h-3.5" />
               <span className="font-semibold whitespace-nowrap">
-                {wsConnected ? 'ซิงค์ Real-Time (WS)' : 'กำลังเชื่อมต่อ WS...'}
+                {telegramConfig.serverRuntime === 'vercel' || syncTransport === 'http'
+                  ? wsConnected
+                    ? 'ซิงค์สด (Vercel Live Sync)'
+                    : 'กำลังซิงค์ข้อมูล...'
+                  : wsConnected
+                  ? 'ซิงค์ Real-Time (WS)'
+                  : 'กำลังเชื่อมต่อ WS...'}
               </span>
             </div>
 
@@ -333,7 +341,9 @@ export const TelegramHub: React.FC<TelegramHubProps> = ({
               <span className="font-semibold whitespace-nowrap">
                 {telegramConfig.pollingActive
                   ? telegramConfig.webhookActive
-                    ? 'รับเลข Webhook 24 ชม. (Active)'
+                    ? telegramConfig.serverRuntime === 'vercel'
+                      ? 'Webhook 24 ชม. (Vercel Active)'
+                      : 'รับเลข Webhook 24 ชม. (Active)'
                     : 'รับเลข Polling สด (Active)'
                   : 'โหมดรับเลขปิดอยู่'}
               </span>
@@ -599,12 +609,14 @@ export const TelegramHub: React.FC<TelegramHubProps> = ({
                 />
               </label>
 
-              {/* Receiver Mode Selector: Webhook (Render) vs Polling (Local/Dev) */}
+              {/* Receiver Mode Selector: Webhook (Vercel/Production) vs Polling (Local/Node) */}
               <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
                 <div className="flex items-center justify-between text-xs">
                   <span className="font-semibold text-white">โหมดการรับข้อมูลจาก Telegram</span>
                   <span className="text-[10px] font-mono text-sky-300">
-                    {telegramConfig.webhookActive ? 'Webhook Push' : 'Long Polling'}
+                    {telegramConfig.serverRuntime === 'vercel' || telegramConfig.webhookActive
+                      ? 'Webhook Push'
+                      : 'Long Polling'}
                   </span>
                 </div>
                 <div className="grid grid-cols-2 gap-1.5">
@@ -612,28 +624,39 @@ export const TelegramHub: React.FC<TelegramHubProps> = ({
                     type="button"
                     onClick={() => onSaveConfig({ receiverMode: 'webhook', pollingActive: true })}
                     className={`min-h-[38px] px-2 py-1.5 rounded-lg text-[11px] font-bold border transition-all ${
-                      telegramConfig.receiverMode === 'webhook'
+                      telegramConfig.receiverMode === 'webhook' || telegramConfig.serverRuntime === 'vercel'
                         ? 'bg-emerald-600 text-slate-950 border-emerald-400'
                         : 'bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800'
                     }`}
                   >
-                    Webhook (เสถียรสุดบน Render)
+                    Webhook ({telegramConfig.serverRuntime === 'vercel' ? 'Vercel 24 ชม.' : 'เสถียรสุดบนคลาวด์'})
                   </button>
                   <button
                     type="button"
+                    disabled={telegramConfig.serverRuntime === 'vercel'}
                     onClick={() => onSaveConfig({ receiverMode: 'polling', pollingActive: true })}
-                    className={`min-h-[38px] px-2 py-1.5 rounded-lg text-[11px] font-bold border transition-all ${
-                      telegramConfig.receiverMode !== 'webhook'
+                    className={`min-h-[38px] px-2 py-1.5 rounded-lg text-[11px] font-bold border transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
+                      telegramConfig.receiverMode !== 'webhook' && telegramConfig.serverRuntime !== 'vercel'
                         ? 'bg-sky-500 text-slate-950 border-sky-400'
                         : 'bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800'
                     }`}
                   >
-                    Polling (ใช้ได้ทุกเครื่อง)
+                    Polling ({telegramConfig.serverRuntime === 'vercel' ? 'เฉพาะเครื่อง Node' : 'ใช้ได้ทุกเครื่อง'})
                   </button>
                 </div>
+                {telegramConfig.serverRuntime === 'vercel' && (
+                  <p className="text-[10px] text-emerald-300/90 leading-snug">
+                    Webhook Endpoint: <code className="text-emerald-200 break-all">{telegramConfig.webhookUrl}</code>
+                  </p>
+                )}
+                {telegramConfig.serverRuntime === 'vercel' && !telegramConfig.hasPersistentStore && (
+                  <p className="text-[10px] text-amber-300/90 leading-snug">
+                    แนะนำบน Vercel: เพิ่มฐานข้อมูลฟรี <strong>Upstash Redis</strong> ในเมนู Storage ของโปรเจกต์ Vercel เพื่อให้สถิติและเลขจาก Telegram ซิงค์ข้ามทุก Serverless Function ได้ 100%
+                  </p>
+                )}
                 {!telegramConfig.hasEnvToken && telegramConfig.hasToken && (
                   <p className="text-[10px] text-amber-300/90 leading-snug">
-                    แนะนำ: ใส่ <code className="text-amber-200">TELEGRAM_BOT_TOKEN</code> และ <code className="text-amber-200">TELEGRAM_CHAT_ID</code> ใน Render Environment ด้วย เพื่อไม่ให้ค่าหายเวลาเซิร์ฟเวอร์รีสตาร์ทครับ
+                    แนะนำ: ใส่ <code className="text-amber-200">TELEGRAM_BOT_TOKEN</code> และ <code className="text-amber-200">TELEGRAM_CHAT_ID</code> ใน Environment Variables ของ Vercel ด้วย เพื่อไม่ให้ค่าหลุดเมื่อรีดีพลอย
                   </p>
                 )}
               </div>

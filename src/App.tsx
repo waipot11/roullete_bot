@@ -74,7 +74,10 @@ export default function App() {
   const [telegramLogs, setTelegramLogs] = useState<TelegramLogEntry[]>([]);
   const [detectedChats, setDetectedChats] = useState<TelegramDetectedChat[]>([]);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const [syncTransport, setSyncTransport] = useState<'ws' | 'http'>('ws');
   const [liveToast, setLiveToast] = useState<{ text: string; tone: 'emerald' | 'sky' | 'rose' } | null>(null);
+  const hasInitializedServerStateRef = useRef<boolean>(false);
+  const lastKnownSpinIdRef = useRef<string | null>(null);
 
   // Active Tab (Default to dual screen mode for effortless 2-screen mobile tracking)
   const [activeTab, setActiveTab] = useState<ActiveTab>('dual');
@@ -163,6 +166,22 @@ export default function App() {
   // Apply authoritative state payload received from server REST or WebSocket
   const applyServerState = useCallback((payload: ServerAppStatePayload) => {
     if (!payload) return;
+
+    const latestSpin = payload.spins?.[payload.spins.length - 1];
+    if (hasInitializedServerStateRef.current && latestSpin && latestSpin.id !== lastKnownSpinIdRef.current) {
+      lastKnownSpinIdRef.current = latestSpin.id;
+      if (latestSpin.source === 'telegram') {
+        playTone(latestSpin.betWon ? 'win' : 'lose');
+        showToast(
+          `รับเลข #${latestSpin.number} จาก Telegram (${latestSpin.telegramSender || 'สมาชิก'}) — อัปเดตชุดเลขใหม่แล้ว!`,
+          latestSpin.betWon ? 'emerald' : 'sky'
+        );
+      }
+    } else if (!hasInitializedServerStateRef.current) {
+      hasInitializedServerStateRef.current = true;
+      lastKnownSpinIdRef.current = latestSpin?.id ?? null;
+    }
+
     setSpins(payload.spins);
     setSelectedStrategy(payload.selectedStrategy);
     setCurrentStep(payload.currentStep);
@@ -175,27 +194,45 @@ export default function App() {
     if (matchedTable) {
       setCurrentTable(matchedTable);
     }
-  }, []);
+  }, [playTone, showToast]);
 
-  // Hydrate initial state and establish live WebSocket connection to /ws
+  // Hydrate initial state and establish live sync (HTTP Live Sync on Vercel Serverless, WebSocket /ws on Node)
   useEffect(() => {
     let isMounted = true;
     let socket: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let pingTimer: ReturnType<typeof setInterval> | null = null;
+    let httpPollTimer: ReturnType<typeof setInterval> | null = null;
+    let wsFailCount = 0;
 
-    const hydrate = async () => {
+    const startHttpSync = () => {
+      if (!isMounted) return;
+      setSyncTransport('http');
+      setWsConnected(true);
+      if (httpPollTimer) return;
+      httpPollTimer = setInterval(() => {
+        if (isMounted && document.visibilityState === 'visible') {
+          void hydrate();
+        }
+      }, 2500);
+    };
+
+    const hydrate = async (): Promise<ServerAppStatePayload | null> => {
       try {
-        const res = await fetch('/api/state');
+        const res = await fetch('/api/state', { cache: 'no-store' });
         if (res.ok && isMounted) {
           const data = (await res.json()) as ServerAppStatePayload;
           applyServerState(data);
+          if (data.telegramConfig?.serverRuntime === 'vercel') {
+            startHttpSync();
+          }
+          return data;
         }
       } catch {
         // Fallback to local state if server temporarily unavailable
       }
+      return null;
     };
-
-    let pingTimer: ReturnType<typeof setInterval> | null = null;
 
     const connectWs = () => {
       if (!isMounted || typeof window === 'undefined') return;
@@ -206,7 +243,15 @@ export default function App() {
       socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
       socket.onopen = () => {
-        if (isMounted) setWsConnected(true);
+        wsFailCount = 0;
+        if (isMounted) {
+          setSyncTransport('ws');
+          setWsConnected(true);
+        }
+        if (httpPollTimer) {
+          clearInterval(httpPollTimer);
+          httpPollTimer = null;
+        }
         if (pingTimer) clearInterval(pingTimer);
         pingTimer = setInterval(() => {
           if (socket?.readyState === WebSocket.OPEN) {
@@ -221,23 +266,10 @@ export default function App() {
           const msg = JSON.parse(event.data) as {
             type: string;
             payload?: ServerAppStatePayload;
-            meta?: {
-              spin?: SpinRecord;
-              isWin?: boolean;
-              source?: string;
-              telegramSender?: string;
-            };
           };
           if (msg.type === 'pong') return;
           if (msg.payload) {
             applyServerState(msg.payload);
-          }
-          if (msg.type === 'spin:added' && msg.meta?.source === 'telegram' && msg.meta.spin) {
-            playTone(msg.meta.isWin ? 'win' : 'lose');
-            showToast(
-              `รับเลข #${msg.meta.spin.number} จาก Telegram (${msg.meta.telegramSender || 'สมาชิก'}) — อัปเดตชุดเลขใหม่แล้ว!`,
-              msg.meta.isWin ? 'emerald' : 'sky'
-            );
           }
         } catch {
           // Ignore malformed WS frame
@@ -246,11 +278,17 @@ export default function App() {
 
       socket.onclose = () => {
         if (!isMounted) return;
-        setWsConnected(false);
+        wsFailCount += 1;
         if (pingTimer) {
           clearInterval(pingTimer);
           pingTimer = null;
         }
+        if (wsFailCount >= 2) {
+          // Gracefully switch to HTTP Live Sync when WebSocket isn't supported (e.g. serverless proxy)
+          startHttpSync();
+          return;
+        }
+        setWsConnected(false);
         reconnectTimer = setTimeout(connectWs, 1500);
       };
 
@@ -261,25 +299,34 @@ export default function App() {
 
     const handleVisibility = () => {
       if (document.visibilityState === 'visible' && isMounted) {
-        void hydrate();
-        if (!socket || socket.readyState !== WebSocket.OPEN) {
-          connectWs();
-        }
+        void hydrate().then((data) => {
+          if (data?.telegramConfig?.serverRuntime !== 'vercel' && (!socket || socket.readyState !== WebSocket.OPEN)) {
+            wsFailCount = 0;
+            connectWs();
+          }
+        });
       }
     };
 
     document.addEventListener('visibilitychange', handleVisibility);
-    void hydrate();
-    connectWs();
+    void hydrate().then((data) => {
+      if (!isMounted) return;
+      if (data?.telegramConfig?.serverRuntime === 'vercel') {
+        startHttpSync();
+      } else {
+        connectWs();
+      }
+    });
 
     return () => {
       isMounted = false;
       document.removeEventListener('visibilitychange', handleVisibility);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (pingTimer) clearInterval(pingTimer);
+      if (httpPollTimer) clearInterval(httpPollTimer);
       socket?.close();
     };
-  }, [applyServerState, playTone, showToast]);
+  }, [applyServerState]);
 
   // Add a newly spun number (syncs with server + auto-broadcasts to Telegram if enabled)
   const handleAddNumber = useCallback(async (num: number) => {
@@ -972,6 +1019,7 @@ export default function App() {
             telegramLogs={telegramLogs}
             detectedChats={detectedChats}
             wsConnected={wsConnected}
+            syncTransport={syncTransport}
             prediction={prediction}
             rowStats={rowStats}
             selectedStrategy={selectedStrategy}

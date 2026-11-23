@@ -174,6 +174,8 @@ export interface TelegramPublicConfig {
   lastError: string | null;
   lastSyncAt: number | null;
   webhookUrl: string;
+  serverRuntime?: 'vercel' | 'node';
+  hasPersistentStore?: boolean;
 }
 
 export interface TelegramDetectedChat {

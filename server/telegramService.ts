@@ -1,5 +1,6 @@
 import dns from 'dns';
 import fs from 'fs';
+import http from 'http';
 import https from 'https';
 import path from 'path';
 import type {
@@ -33,9 +34,29 @@ interface InternalTelegramConfig {
   lastSyncAt: number | null;
 }
 
-const CONFIG_FILE_PATH = path.resolve(process.cwd(), '.telegram-config.json');
+const KV_STATE_KEY = 'roulette_pro_state_v1';
+
+interface PersistedServiceState {
+  spins?: SpinRecord[];
+  selectedStrategy?: StrategyTier;
+  currentStep?: number;
+  consecutiveLosses?: number;
+  stopLossNotice?: string | null;
+  bankrollConfig?: BankrollConfig;
+  currentTableId?: string;
+  telegramConfig?: Partial<InternalTelegramConfig> & { tokenCleared?: boolean };
+  telegramLogs?: TelegramLogEntry[];
+  detectedChats?: TelegramDetectedChat[];
+  processedUpdateIds?: number[];
+  updatedAt?: number;
+}
 
 export class RouletteTelegramServerService {
+  private readonly isVercel: boolean =
+    process.env.VERCEL === '1' ||
+    Boolean(process.env.VERCEL_URL) ||
+    Boolean(process.env.VERCEL_PROJECT_PRODUCTION_URL);
+
   private spins: SpinRecord[] = [];
   private selectedStrategy: StrategyTier = 'quantum_core_10';
   private currentStep: number = 1;
@@ -59,7 +80,7 @@ export class RouletteTelegramServerService {
     chatTitle: '',
     isConnected: false,
     pollingActive: Boolean(process.env.TELEGRAM_BOT_TOKEN),
-    receiverMode: 'polling',
+    receiverMode: this.isVercel ? 'webhook' : 'polling',
     webhookActive: false,
     autoBroadcastOnAppSpin: true,
     autoBroadcastOnTelegramSpin: true,
@@ -69,6 +90,7 @@ export class RouletteTelegramServerService {
   };
 
   private detectedPublicOrigin: string = '';
+  private tokenClearedExplicitly: boolean = false;
   private telegramLogs: TelegramLogEntry[] = [];
   private detectedChats: Map<string, TelegramDetectedChat> = new Map();
   private processedUpdateIds: Set<number> = new Set();
@@ -80,6 +102,10 @@ export class RouletteTelegramServerService {
   private pollConsecutiveFailures: number = 0;
   private lastPollFinishAt: number = 0;
   private lastWebhookCheckAt: number = 0;
+  private hasHydratedOnce: boolean = false;
+  private lastHydratedAt: number = 0;
+  private autoWebhookAttempted: boolean = false;
+  private hydrationPromise: Promise<void> | null = null;
   private listeners: Set<(event: { type: string; payload: ServerAppStatePayload; meta?: Record<string, unknown> }) => void> = new Set();
 
   constructor() {
@@ -89,22 +115,62 @@ export class RouletteTelegramServerService {
       // Ignore if unsupported
     }
 
-    const envUrl = (process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+    const envUrl = this.getEnvBaseUrl();
     if (this.isPublicWebhookCapable(envUrl)) {
       this.detectedPublicOrigin = envUrl;
       this.telegramConfig.receiverMode = 'webhook';
     }
 
     this.spins = generateInitialHistory(this.currentTableId, 60);
-    this.loadSavedConfig();
+    this.loadSavedStateFromDiskSync();
 
-    // Start 30-second self-healing watchdog so bot never stays dead after transient network glitches
-    this.startWatchdog();
-
-    if (this.telegramConfig.botToken) {
-      this.telegramConfig.pollingActive = true;
-      void this.ensureConnectedAndReceiving();
+    if (this.isVercel) {
+      // Vercel Serverless cannot run background intervals or long-polling loops; always use Webhook
+      this.telegramConfig.receiverMode = 'webhook';
+    } else {
+      // Node / Render / AI Studio: start 30-second self-healing watchdog & polling/webhook
+      this.startWatchdog();
+      if (this.telegramConfig.botToken) {
+        this.telegramConfig.pollingActive = true;
+        void this.ensureConnectedAndReceiving();
+      }
     }
+  }
+
+  private getStateFilePath(): string {
+    return this.isVercel ? '/tmp/roulette-state.json' : path.resolve(process.cwd(), '.telegram-config.json');
+  }
+
+  private getKvCredentials(): { url: string; token: string } | null {
+    const url = (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '').trim().replace(/\/$/, '');
+    const token = (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
+    if (!url || !token) return null;
+    return { url, token };
+  }
+
+  private normalizeOrigin(raw?: string): string {
+    const trimmed = (raw || '').trim().replace(/\/$/, '');
+    if (!trimmed) return '';
+    if (trimmed.startsWith('https://') || trimmed.startsWith('http://')) {
+      return trimmed;
+    }
+    return `https://${trimmed}`;
+  }
+
+  private getEnvBaseUrl(): string {
+    const candidates = [
+      process.env.APP_URL,
+      process.env.VERCEL_PROJECT_PRODUCTION_URL,
+      process.env.VERCEL_URL,
+      process.env.RENDER_EXTERNAL_URL
+    ];
+    for (const raw of candidates) {
+      const normalized = this.normalizeOrigin(raw);
+      if (this.isPublicWebhookCapable(normalized)) {
+        return normalized;
+      }
+    }
+    return '';
   }
 
   private isPublicWebhookCapable(url: string): boolean {
@@ -117,69 +183,266 @@ export class RouletteTelegramServerService {
   }
 
   private getEffectiveBaseUrl(): string {
-    const envUrl = (process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+    const envUrl = this.getEnvBaseUrl();
     if (this.isPublicWebhookCapable(envUrl)) return envUrl;
     if (this.isPublicWebhookCapable(this.detectedPublicOrigin)) return this.detectedPublicOrigin;
     return '';
   }
 
-  // Called by server.ts whenever an HTTPS request arrives from a public host (e.g. Render)
+  // Called by Express middleware whenever an HTTPS request arrives from a public host
   public registerPublicOrigin(origin: string) {
-    const clean = origin.replace(/\/$/, '');
+    const clean = this.normalizeOrigin(origin);
     if (!this.isPublicWebhookCapable(clean)) return;
     const changed = this.detectedPublicOrigin !== clean;
     this.detectedPublicOrigin = clean;
 
-    // Auto-upgrade to ultra-stable Webhook mode on Render if token is active and not explicitly forced off
-    if (changed && this.telegramConfig.botToken && this.telegramConfig.pollingActive && !this.telegramConfig.webhookActive) {
+    if (!this.isVercel && changed && this.telegramConfig.botToken && this.telegramConfig.pollingActive && !this.telegramConfig.webhookActive) {
       this.telegramConfig.receiverMode = 'webhook';
       void this.ensureConnectedAndReceiving();
     }
   }
 
-  private loadSavedConfig() {
+  private applyPersistedState(parsed: PersistedServiceState) {
+    if (!parsed || typeof parsed !== 'object') return;
+
+    if (Array.isArray(parsed.spins) && parsed.spins.length > 0) {
+      this.spins = parsed.spins.slice(-500);
+    }
+    if (parsed.selectedStrategy) {
+      this.selectedStrategy = parsed.selectedStrategy;
+    }
+    if (typeof parsed.currentStep === 'number' && parsed.currentStep >= 1 && parsed.currentStep <= 3) {
+      this.currentStep = parsed.currentStep;
+    }
+    if (typeof parsed.consecutiveLosses === 'number') {
+      this.consecutiveLosses = parsed.consecutiveLosses;
+    }
+    if (parsed.stopLossNotice !== undefined) {
+      this.stopLossNotice = parsed.stopLossNotice;
+    }
+    if (parsed.bankrollConfig && typeof parsed.bankrollConfig === 'object') {
+      this.bankrollConfig = { ...this.bankrollConfig, ...parsed.bankrollConfig };
+    }
+    if (typeof parsed.currentTableId === 'string' && parsed.currentTableId) {
+      this.currentTableId = parsed.currentTableId;
+    }
+    if (Array.isArray(parsed.telegramLogs)) {
+      this.telegramLogs = parsed.telegramLogs.slice(0, 60);
+    }
+    if (Array.isArray(parsed.detectedChats)) {
+      this.detectedChats = new Map(parsed.detectedChats.map((c) => [c.chatId, c]));
+    }
+    if (Array.isArray(parsed.processedUpdateIds)) {
+      this.processedUpdateIds = new Set(parsed.processedUpdateIds.slice(-200));
+    }
+
+    const tg = parsed.telegramConfig;
+    if (tg && typeof tg === 'object') {
+      this.tokenClearedExplicitly = Boolean(tg.tokenCleared);
+      const envBase = this.getEffectiveBaseUrl();
+      const restoredToken = this.tokenClearedExplicitly
+        ? ''
+        : process.env.TELEGRAM_BOT_TOKEN || tg.botToken || '';
+      const restoredChatId = process.env.TELEGRAM_CHAT_ID || tg.chatId || '';
+
+      this.telegramConfig = {
+        ...this.telegramConfig,
+        botToken: restoredToken,
+        chatId: restoredChatId,
+        botUsername: tg.botUsername ?? this.telegramConfig.botUsername,
+        chatTitle: tg.chatTitle ?? this.telegramConfig.chatTitle,
+        isConnected: tg.isConnected ?? this.telegramConfig.isConnected,
+        webhookActive: tg.webhookActive ?? this.telegramConfig.webhookActive,
+        autoBroadcastOnAppSpin: tg.autoBroadcastOnAppSpin ?? true,
+        autoBroadcastOnTelegramSpin: tg.autoBroadcastOnTelegramSpin ?? true,
+        includeFullStatsInBroadcast: tg.includeFullStatsInBroadcast ?? true,
+        pollingActive: tg.pollingActive ?? Boolean(restoredToken),
+        lastSyncAt: tg.lastSyncAt ?? this.telegramConfig.lastSyncAt,
+        receiverMode: this.isVercel ? 'webhook' : envBase ? (tg.receiverMode || 'webhook') : 'polling'
+      };
+    }
+  }
+
+  private loadSavedStateFromDiskSync() {
     try {
-      if (fs.existsSync(CONFIG_FILE_PATH)) {
-        const raw = fs.readFileSync(CONFIG_FILE_PATH, 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object') {
-          const envBase = this.getEffectiveBaseUrl();
-          this.telegramConfig = {
-            ...this.telegramConfig,
-            botToken: process.env.TELEGRAM_BOT_TOKEN || parsed.botToken || '',
-            chatId: process.env.TELEGRAM_CHAT_ID || parsed.chatId || '',
-            botUsername: parsed.botUsername || '',
-            chatTitle: parsed.chatTitle || '',
-            autoBroadcastOnAppSpin: parsed.autoBroadcastOnAppSpin ?? true,
-            autoBroadcastOnTelegramSpin: parsed.autoBroadcastOnTelegramSpin ?? true,
-            includeFullStatsInBroadcast: parsed.includeFullStatsInBroadcast ?? true,
-            pollingActive: parsed.pollingActive ?? Boolean(process.env.TELEGRAM_BOT_TOKEN || parsed.botToken),
-            receiverMode: envBase ? (parsed.receiverMode || 'webhook') : 'polling'
-          };
-        }
+      const filePath = this.getStateFilePath();
+      if (fs.existsSync(filePath)) {
+        const raw = fs.readFileSync(filePath, 'utf-8');
+        const parsed = JSON.parse(raw) as PersistedServiceState;
+        this.applyPersistedState(parsed);
       }
     } catch {
       // Ignore file read errors in ephemeral environments
     }
   }
 
-  private saveConfigToDisk() {
-    try {
-      const toSave = {
+  private kvRequest(
+    method: 'GET' | 'POST',
+    fullUrl: string,
+    token: string,
+    bodyJson?: string
+  ): Promise<{ ok: boolean; result?: unknown }> {
+    return new Promise((resolve) => {
+      try {
+        const parsedUrl = new URL(fullUrl);
+        const transport = parsedUrl.protocol === 'http:' ? http : https;
+        const headers: Record<string, string | number> = {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json'
+        };
+        if (bodyJson !== undefined) {
+          headers['Content-Type'] = 'application/json';
+          headers['Content-Length'] = Buffer.byteLength(bodyJson);
+        }
+
+        const req = transport.request(
+          {
+            hostname: parsedUrl.hostname,
+            port: parsedUrl.port || (parsedUrl.protocol === 'http:' ? 80 : 443),
+            path: `${parsedUrl.pathname}${parsedUrl.search}`,
+            method,
+            family: 4,
+            agent: false,
+            headers
+          },
+          (res) => {
+            const chunks: Buffer[] = [];
+            res.on('data', (chunk: Buffer) => chunks.push(chunk));
+            res.on('end', () => {
+              try {
+                const text = Buffer.concat(chunks).toString('utf8');
+                const json = JSON.parse(text) as { result?: unknown; error?: string };
+                resolve({ ok: (res.statusCode || 500) < 400 && !json.error, result: json.result });
+              } catch {
+                resolve({ ok: false });
+              }
+            });
+          }
+        );
+
+        req.setTimeout(4500, () => {
+          req.destroy(new Error('KV timeout'));
+        });
+        req.on('error', () => resolve({ ok: false }));
+        if (bodyJson !== undefined) {
+          req.write(bodyJson);
+        }
+        req.end();
+      } catch {
+        resolve({ ok: false });
+      }
+    });
+  }
+
+  public async ensureHydrated(options?: { forceRefresh?: boolean; skipAutoWebhook?: boolean }): Promise<void> {
+    if (this.hydrationPromise) {
+      return this.hydrationPromise;
+    }
+
+    const kv = this.getKvCredentials();
+    const shouldFetchKv = Boolean(kv && (!this.hasHydratedOnce || (options?.forceRefresh && Date.now() - this.lastHydratedAt > 350)));
+    const shouldReadDisk = !kv && !this.hasHydratedOnce;
+
+    if (!shouldFetchKv && !shouldReadDisk) {
+      if (
+        this.isVercel &&
+        !options?.skipAutoWebhook &&
+        !this.autoWebhookAttempted &&
+        this.telegramConfig.botToken &&
+        this.telegramConfig.pollingActive &&
+        !this.telegramConfig.webhookActive &&
+        this.getEffectiveBaseUrl()
+      ) {
+        this.autoWebhookAttempted = true;
+        await this.ensureConnectedAndReceiving();
+      }
+      return;
+    }
+
+    this.hydrationPromise = (async () => {
+      try {
+        if (kv) {
+          const res = await this.kvRequest('GET', `${kv.url}/get/${KV_STATE_KEY}`, kv.token);
+          if (res.ok && typeof res.result === 'string' && res.result.trim()) {
+            const parsed = JSON.parse(res.result) as PersistedServiceState;
+            this.applyPersistedState(parsed);
+          }
+        } else {
+          this.loadSavedStateFromDiskSync();
+        }
+        this.hasHydratedOnce = true;
+        this.lastHydratedAt = Date.now();
+
+        if (
+          this.isVercel &&
+          !options?.skipAutoWebhook &&
+          !this.autoWebhookAttempted &&
+          this.telegramConfig.botToken &&
+          this.telegramConfig.pollingActive &&
+          !this.telegramConfig.webhookActive &&
+          this.getEffectiveBaseUrl()
+        ) {
+          this.autoWebhookAttempted = true;
+          await this.ensureConnectedAndReceiving();
+        }
+      } catch {
+        this.hasHydratedOnce = true;
+      } finally {
+        this.hydrationPromise = null;
+      }
+    })();
+
+    return this.hydrationPromise;
+  }
+
+  private buildPersistedState(): PersistedServiceState {
+    return {
+      spins: this.spins.slice(-150),
+      selectedStrategy: this.selectedStrategy,
+      currentStep: this.currentStep,
+      consecutiveLosses: this.consecutiveLosses,
+      stopLossNotice: this.stopLossNotice,
+      bankrollConfig: this.bankrollConfig,
+      currentTableId: this.currentTableId,
+      telegramConfig: {
         botToken: this.telegramConfig.botToken,
         chatId: this.telegramConfig.chatId,
         botUsername: this.telegramConfig.botUsername,
         chatTitle: this.telegramConfig.chatTitle,
+        isConnected: this.telegramConfig.isConnected,
+        webhookActive: this.telegramConfig.webhookActive,
         autoBroadcastOnAppSpin: this.telegramConfig.autoBroadcastOnAppSpin,
         autoBroadcastOnTelegramSpin: this.telegramConfig.autoBroadcastOnTelegramSpin,
         includeFullStatsInBroadcast: this.telegramConfig.includeFullStatsInBroadcast,
         pollingActive: this.telegramConfig.pollingActive,
-        receiverMode: this.telegramConfig.receiverMode
-      };
-      fs.writeFileSync(CONFIG_FILE_PATH, JSON.stringify(toSave, null, 2), 'utf-8');
+        receiverMode: this.telegramConfig.receiverMode,
+        lastSyncAt: this.telegramConfig.lastSyncAt,
+        tokenCleared: this.tokenClearedExplicitly
+      },
+      telegramLogs: this.telegramLogs.slice(0, 30),
+      detectedChats: Array.from(this.detectedChats.values()).slice(0, 12),
+      processedUpdateIds: Array.from(this.processedUpdateIds).slice(-100),
+      updatedAt: Date.now()
+    };
+  }
+
+  private async persistState(): Promise<void> {
+    const serialized = JSON.stringify(this.buildPersistedState());
+    try {
+      fs.writeFileSync(this.getStateFilePath(), serialized, 'utf-8');
     } catch {
       // Ignore write errors in read-only sandboxes
     }
+
+    const kv = this.getKvCredentials();
+    if (kv) {
+      await this.kvRequest('POST', kv.url, kv.token, JSON.stringify(['SET', KV_STATE_KEY, serialized]));
+    }
+    this.lastHydratedAt = Date.now();
+  }
+
+  private saveConfigToDisk() {
+    void this.persistState();
   }
 
   public subscribe(listener: (event: { type: string; payload: ServerAppStatePayload; meta?: Record<string, unknown> }) => void) {
@@ -217,9 +480,10 @@ export class RouletteTelegramServerService {
 
   public getPublicTelegramConfig(): TelegramPublicConfig {
     const baseUrl = this.getEffectiveBaseUrl();
-    const isReceiving =
-      this.telegramConfig.pollingActive &&
-      (this.telegramConfig.webhookActive || this.isPollingRunning);
+    const isReceiving = this.isVercel
+      ? this.telegramConfig.pollingActive && this.telegramConfig.webhookActive
+      : this.telegramConfig.pollingActive &&
+        (this.telegramConfig.webhookActive || this.isPollingRunning);
 
     return {
       hasToken: Boolean(this.telegramConfig.botToken),
@@ -230,14 +494,16 @@ export class RouletteTelegramServerService {
       chatTitle: this.telegramConfig.chatTitle,
       isConnected: this.telegramConfig.isConnected,
       pollingActive: isReceiving,
-      receiverMode: this.telegramConfig.receiverMode,
+      receiverMode: this.isVercel ? 'webhook' : this.telegramConfig.receiverMode,
       webhookActive: this.telegramConfig.webhookActive,
       autoBroadcastOnAppSpin: this.telegramConfig.autoBroadcastOnAppSpin,
       autoBroadcastOnTelegramSpin: this.telegramConfig.autoBroadcastOnTelegramSpin,
       includeFullStatsInBroadcast: this.telegramConfig.includeFullStatsInBroadcast,
       lastError: this.telegramConfig.lastError,
       lastSyncAt: this.telegramConfig.lastSyncAt,
-      webhookUrl: baseUrl ? `${baseUrl}/api/telegram/webhook` : '/api/telegram/webhook'
+      webhookUrl: baseUrl ? `${baseUrl}/api/telegram/webhook` : '/api/telegram/webhook',
+      serverRuntime: this.isVercel ? 'vercel' : 'node',
+      hasPersistentStore: Boolean(this.getKvCredentials())
     };
   }
 
@@ -270,7 +536,7 @@ export class RouletteTelegramServerService {
     );
   }
 
-  public updateClientSettings(settings: {
+  public async updateClientSettings(settings: {
     selectedStrategy?: StrategyTier;
     bankrollConfig?: Partial<BankrollConfig>;
     currentTableId?: string;
@@ -293,10 +559,11 @@ export class RouletteTelegramServerService {
       }
     }
     this.emitState('settings:updated');
+    await this.persistState();
     return this.getPublicState();
   }
 
-  public resetSession(keepSpins: boolean = false) {
+  public async resetSession(keepSpins: boolean = false) {
     if (!keepSpins) {
       this.spins = generateInitialHistory(this.currentTableId, 45);
     }
@@ -305,10 +572,11 @@ export class RouletteTelegramServerService {
     this.stopLossNotice = null;
     this.bankrollConfig.currentCapital = this.bankrollConfig.initialCapital;
     this.emitState('session:reset');
+    await this.persistState();
     return this.getPublicState();
   }
 
-  public undoLastSpin() {
+  public async undoLastSpin() {
     if (this.spins.length === 0) return this.getPublicState();
     const last = this.spins[this.spins.length - 1];
     const profitUnits = last.profit ?? (last.betWon ? 1 : -36);
@@ -316,10 +584,11 @@ export class RouletteTelegramServerService {
     this.spins = this.spins.slice(0, -1);
     this.bankrollConfig.currentCapital = Math.max(0, this.bankrollConfig.currentCapital - profitAmount);
     this.emitState('spin:undone');
+    await this.persistState();
     return this.getPublicState();
   }
 
-  public importNumbers(numbers: number[]) {
+  public async importNumbers(numbers: number[]) {
     const now = Date.now();
     const valid = numbers.filter((n) => Number.isInteger(n) && n >= 0 && n <= 36);
     const newRecords: SpinRecord[] = valid.map((num, idx) => {
@@ -338,6 +607,7 @@ export class RouletteTelegramServerService {
     });
     this.spins = [...this.spins, ...newRecords].slice(-500);
     this.emitState('spins:imported');
+    await this.persistState();
     return this.getPublicState();
   }
 
@@ -426,6 +696,8 @@ export class RouletteTelegramServerService {
         stopLossTriggered
       });
       broadcastResult = await this.sendTelegramMessage(msgHtml, 'broadcast_prediction');
+    } else {
+      await this.persistState();
     }
 
     return {
@@ -673,12 +945,12 @@ export class RouletteTelegramServerService {
     }
   }
 
-  // Ensures the optimal receiver (Webhook on Render, Polling on local/dev) is active
   public async ensureConnectedAndReceiving(): Promise<boolean> {
     if (!this.telegramConfig.botToken) return false;
 
     const ok = await this.verifyBotConnection();
     if (!ok) {
+      await this.persistState();
       this.emitState('telegram:config_updated');
       return false;
     }
@@ -695,15 +967,15 @@ export class RouletteTelegramServerService {
     }
 
     if (!this.telegramConfig.pollingActive) {
-      this.stopPolling();
+      this.stopPolling(false);
       this.telegramConfig.webhookActive = false;
-      this.saveConfigToDisk();
+      await this.persistState();
       this.emitState('telegram:config_updated');
       return true;
     }
 
     const baseUrl = this.getEffectiveBaseUrl();
-    if (this.telegramConfig.receiverMode === 'webhook' && baseUrl) {
+    if ((this.telegramConfig.receiverMode === 'webhook' || this.isVercel) && baseUrl) {
       const webhookUrl = `${baseUrl}/api/telegram/webhook`;
       const setRes = await this.callTelegramApi('setWebhook', {
         url: webhookUrl,
@@ -712,24 +984,42 @@ export class RouletteTelegramServerService {
       });
 
       if (setRes.ok) {
-        this.stopPolling(true); // Stop polling loop while keeping pollingActive=true (receiving via webhook!)
+        this.stopPolling(true);
+        this.telegramConfig.receiverMode = 'webhook';
         this.telegramConfig.webhookActive = true;
         this.telegramConfig.lastError = null;
         this.lastWebhookCheckAt = Date.now();
-        this.saveConfigToDisk();
+        await this.persistState();
         this.emitState('telegram:config_updated');
         return true;
       }
-      // Fallback gracefully to polling if setWebhook fails
+
+      if (this.isVercel) {
+        this.telegramConfig.receiverMode = 'webhook';
+        this.telegramConfig.webhookActive = false;
+        this.telegramConfig.lastError = setRes.description || 'ตั้งค่า Telegram Webhook บน Vercel ไม่สำเร็จ';
+        await this.persistState();
+        this.emitState('telegram:config_updated');
+        return false;
+      }
+
+      // Fallback gracefully to polling on persistent Node servers
       this.telegramConfig.receiverMode = 'polling';
       this.telegramConfig.webhookActive = false;
+    } else if (this.isVercel) {
+      this.telegramConfig.receiverMode = 'webhook';
+      this.telegramConfig.webhookActive = false;
+      this.telegramConfig.lastError = 'กำลังรอ HTTPS URL ของ Vercel เพื่อตั้งค่า Telegram Webhook';
+      await this.persistState();
+      this.emitState('telegram:config_updated');
+      return false;
     }
 
-    // Polling mode (local dev / AI Studio preview / webhook fallback)
+    // Polling mode (local dev / AI Studio preview / Node fallback)
     this.telegramConfig.webhookActive = false;
     await this.callTelegramApi('deleteWebhook', { drop_pending_updates: false });
     this.startPolling();
-    this.saveConfigToDisk();
+    await this.persistState();
     this.emitState('telegram:config_updated');
     return true;
   }
@@ -748,18 +1038,20 @@ export class RouletteTelegramServerService {
 
     if (input.clearToken) {
       this.stopPolling(false);
+      this.tokenClearedExplicitly = true;
       this.telegramConfig.botToken = '';
       this.telegramConfig.botUsername = '';
       this.telegramConfig.isConnected = false;
       this.telegramConfig.webhookActive = false;
       this.telegramConfig.lastError = null;
-      this.saveConfigToDisk();
+      await this.persistState();
       this.emitState('telegram:config_updated');
       return this.getPublicTelegramConfig();
     }
 
     if (typeof input.botToken === 'string' && input.botToken.trim().length > 0) {
       const cleanToken = input.botToken.trim();
+      this.tokenClearedExplicitly = false;
       if (cleanToken !== this.telegramConfig.botToken) {
         this.stopPolling(false);
         this.telegramConfig.botToken = cleanToken;
@@ -781,8 +1073,9 @@ export class RouletteTelegramServerService {
     }
 
     if (typeof input.receiverMode === 'string' && (input.receiverMode === 'webhook' || input.receiverMode === 'polling')) {
-      if (input.receiverMode !== this.telegramConfig.receiverMode) {
-        this.telegramConfig.receiverMode = input.receiverMode;
+      const nextMode = this.isVercel ? 'webhook' : input.receiverMode;
+      if (nextMode !== this.telegramConfig.receiverMode) {
+        this.telegramConfig.receiverMode = nextMode;
         needsReceiverRebind = true;
       }
     }
@@ -801,11 +1094,10 @@ export class RouletteTelegramServerService {
       needsReceiverRebind = true;
     }
 
-    // Only re-bind Telegram connection if connection settings actually changed or bot is currently disconnected
     if (this.telegramConfig.botToken && (needsReceiverRebind || !this.telegramConfig.isConnected)) {
       await this.ensureConnectedAndReceiving();
     } else {
-      this.saveConfigToDisk();
+      await this.persistState();
       this.emitState('telegram:config_updated');
     }
 
@@ -823,6 +1115,7 @@ export class RouletteTelegramServerService {
       this.telegramConfig.lastError = err;
       this.addLog({ direction: 'outgoing', eventType: 'error', text: err, success: false });
       this.emitState('telegram:log');
+      await this.persistState();
       return { ok: false, error: err };
     }
     if (!targetChatId) {
@@ -830,6 +1123,7 @@ export class RouletteTelegramServerService {
       this.telegramConfig.lastError = err;
       this.addLog({ direction: 'outgoing', eventType: 'error', text: err, success: false });
       this.emitState('telegram:log');
+      await this.persistState();
       return { ok: false, error: err };
     }
 
@@ -852,6 +1146,7 @@ export class RouletteTelegramServerService {
         success: true
       });
       this.emitState('telegram:sent');
+      await this.persistState();
       return { ok: true };
     } else {
       const errMsg = res.description || 'ส่งข้อความไป Telegram ไม่สำเร็จ';
@@ -864,6 +1159,7 @@ export class RouletteTelegramServerService {
         success: false
       });
       this.emitState('telegram:error');
+      await this.persistState();
       return { ok: false, error: errMsg };
     }
   }
@@ -984,12 +1280,14 @@ export class RouletteTelegramServerService {
 
     if (this.telegramConfig.chatId && chatIdStr !== this.telegramConfig.chatId) {
       this.emitState('telegram:chat_detected');
+      await this.persistState();
       return { handled: false };
     }
 
     const parsed = this.parseTelegramText(msg.text);
     if (parsed.type === 'ignore') {
       this.emitState('telegram:chat_detected');
+      await this.persistState();
       return { handled: false };
     }
 
@@ -1045,7 +1343,7 @@ export class RouletteTelegramServerService {
         senderName,
         success: true
       });
-      this.resetSession(true);
+      await this.resetSession(true);
       const html = this.formatPredictionMessageHtml({
         customHeader: `รีเซ็ตสเต็ปกลับ "ไม้ที่ 1" เรียบร้อยแล้ว`
       });
@@ -1104,6 +1402,8 @@ export class RouletteTelegramServerService {
           stopLossTriggered: lastOutcome.stopLossTriggered
         });
         await this.sendTelegramMessage(msgHtml, 'broadcast_prediction', replyChatId);
+      } else {
+        await this.persistState();
       }
 
       return { handled: true, action: 'spin', numbers: nums };
@@ -1199,7 +1499,7 @@ export class RouletteTelegramServerService {
         }
       }
 
-      if (this.telegramConfig.receiverMode === 'webhook') {
+      if (this.telegramConfig.receiverMode === 'webhook' || this.isVercel) {
         const baseUrl = this.getEffectiveBaseUrl();
         if (baseUrl) {
           await this.callTelegramApi('setWebhook', {
@@ -1211,10 +1511,12 @@ export class RouletteTelegramServerService {
       }
     }
 
+    await this.persistState();
     return this.getDetectedChats();
   }
 
   public startPolling() {
+    if (this.isVercel) return; // Long polling cannot persist across Vercel Serverless invocations
     if (!this.telegramConfig.botToken) return;
     if (this.isPollingRunning) return;
     this.isPollingRunning = true;
